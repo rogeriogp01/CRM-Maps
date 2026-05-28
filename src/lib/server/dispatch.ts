@@ -159,14 +159,32 @@ export async function dispatchOneLead(input: DispatchInput): Promise<DispatchRes
     return { ok: false, error: "INVALID_PHONE", triedAccountIds: [] };
   }
 
-  // 3) Blacklist
+  // 3) Blacklist (ROGA-42 — compliance opt-out).
+  //    Se o telefone está na blacklist, NÃO envia nada e:
+  //      - marca o campaign_lead como skipped/BLACKLISTED
+  //      - grava history de tentativa bloqueada (audit trail LGPD)
+  //      - sincroniza com CRM: lead correspondente vai para "Perdido"
+  //        e registra um evento `dispatch_blocked_opt_out` no histórico.
   if (await isBlacklisted(lead.phone_normalized)) {
     await updateLeadDispatchStatus(lead.id, {
       status: "skipped",
       error: "BLACKLISTED",
-      error_message: "Telefone em blacklist",
+      error_message: "Telefone em blacklist (opt-out)",
       variation_used: input.variationIndex + 1,
     }).catch(() => {});
+
+    await recordHistory({
+      contact_phone: lead.phone_normalized,
+      whatsapp_account_id: null,
+      message_used: "(bloqueado por blacklist — nada enviado)",
+      status: "failed",
+      error: "BLACKLISTED",
+    });
+
+    await syncCrmOptOutBlock({
+      phoneNormalized: lead.phone_normalized,
+    });
+
     return { ok: false, error: "BLACKLISTED", triedAccountIds: [] };
   }
 

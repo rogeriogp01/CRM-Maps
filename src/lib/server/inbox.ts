@@ -16,6 +16,12 @@
 
 import { supabaseAdmin } from "@/lib/server/supabase-admin";
 import { normalizePhone, appendCrmHistory } from "@/lib/crm";
+import {
+  getSystemSettings,
+  matchesOptOut,
+  DEFAULT_OPT_OUT_KEYWORDS,
+  DEFAULT_OPT_OUT_CONFIRMATION,
+} from "@/lib/server/system-settings";
 
 type IncomingMsgType =
   | "text"
@@ -271,6 +277,143 @@ async function hasPreviousIncoming(conversationId: string): Promise<boolean> {
 }
 
 /**
+ * ROGA-42 — Opt-out automático.
+ *
+ * Quando um contato envia uma palavra-chave de opt-out (SAIR/STOP/PARAR/
+ * DESCADASTRAR, ou o que estiver em system_settings.opt_out_keywords):
+ *
+ *   1. Insere o telefone em phone_blacklist (idempotente).
+ *   2. Responde com a mensagem de confirmação configurada.
+ *   3. Marca o lead correspondente como "Perdido" e grava histórico.
+ *
+ * Falhas internas são logadas e silenciadas — opt-out é best-effort por
+ * mensagem; o dispatcher já consulta a blacklist no envio seguinte
+ * (dispatch.ts → isBlacklisted).
+ *
+ * Retorna true se o opt-out foi acionado (mesmo que algum passo
+ * secundário tenha falhado — a INTENÇÃO foi processada).
+ */
+async function handleOptOut(params: {
+  accountId: string;
+  sock: any;
+  jid: string;
+  phoneNormalized: string;
+  body: string | null;
+  conversationId: string;
+  leadId: string | null;
+  timestampIso: string;
+}): Promise<boolean> {
+  if (!params.body || params.body.trim() === "") return false;
+  if (!params.phoneNormalized || params.phoneNormalized.length < 8) return false;
+
+  let keywords: readonly string[] = DEFAULT_OPT_OUT_KEYWORDS;
+  let confirmation = DEFAULT_OPT_OUT_CONFIRMATION;
+  try {
+    const settings = await getSystemSettings();
+    keywords = settings.opt_out_keywords;
+    confirmation = settings.opt_out_confirmation_message;
+  } catch (err) {
+    console.error("[inbox] opt-out: getSystemSettings failed, using defaults:", err);
+  }
+
+  const match = matchesOptOut(params.body, keywords);
+  if (!match.matched) return false;
+
+  console.info(
+    `[inbox] opt-out triggered for ${params.phoneNormalized} (keyword=${match.keyword})`
+  );
+
+  try {
+    const { error: blErr } = await supabaseAdmin
+      .from("phone_blacklist")
+      .upsert(
+        {
+          phone_normalized: params.phoneNormalized,
+          reason: "auto_opt_out",
+        },
+        { onConflict: "phone_normalized", ignoreDuplicates: true }
+      );
+    if (blErr) {
+      console.error("[inbox] opt-out: blacklist upsert failed:", blErr.message);
+    }
+  } catch (err) {
+    console.error("[inbox] opt-out: blacklist exception:", err);
+  }
+
+  try {
+    if (params.sock && typeof params.sock.sendMessage === "function") {
+      const sendResult = await params.sock.sendMessage(params.jid, {
+        text: confirmation,
+      });
+      const outMessageId: string | null =
+        sendResult && typeof sendResult === "object" && "key" in sendResult
+          ? (sendResult as { key?: { id?: string } }).key?.id ?? null
+          : null;
+
+      if (outMessageId) {
+        await recordOutgoingMessage({
+          conversationId: params.conversationId,
+          baileysMessageId: outMessageId,
+          type: "text",
+          body: confirmation,
+          mediaUrl: null,
+          mediaMime: null,
+          timestampMs: Date.now(),
+        }).catch((err) =>
+          console.error("[inbox] opt-out: recordOutgoingMessage failed:", err)
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[inbox] opt-out: send confirmation failed:", err);
+  }
+
+  if (params.leadId) {
+    try {
+      const { data: leadRow } = await supabaseAdmin
+        .from("crm_leads")
+        .select("status")
+        .eq("id", params.leadId)
+        .maybeSingle();
+      const currentStatus = leadRow?.status ?? null;
+
+      if (currentStatus !== "Fechado" && currentStatus !== "Perdido") {
+        const { error: updErr } = await supabaseAdmin
+          .from("crm_leads")
+          .update({
+            status: "Perdido",
+            last_interaction_at: params.timestampIso,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", params.leadId);
+        if (updErr) {
+          console.error("[inbox] opt-out: lead update failed:", updErr.message);
+        }
+      } else {
+        await supabaseAdmin
+          .from("crm_leads")
+          .update({
+            last_interaction_at: params.timestampIso,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", params.leadId);
+      }
+
+      await appendCrmHistory({
+        lead_id: params.leadId,
+        type: "opt_out",
+        message: `Cliente solicitou opt-out via palavra-chave "${match.keyword}". Telefone adicionado à blacklist (reason=auto_opt_out).`,
+        whatsapp_account_id: params.accountId,
+      });
+    } catch (err) {
+      console.error("[inbox] opt-out: lead/history update failed:", err);
+    }
+  }
+
+  return true;
+}
+
+/**
  * Handler principal — chamado pelo listener messages.upsert.
  * Faz catch interno para nunca derrubar o socket.
  */
@@ -388,7 +531,7 @@ export async function handleIncomingMessage(
         .eq("id", conversationId);
     }
 
-    // 5) Sync CRM: SOMENTE para mensagens recebidas (incoming).
+    // 5) Sync CRM + opt-out: SOMENTE para mensagens recebidas (incoming).
     //    Outgoing echo não toca no CRM (o disparador e a rota POST já fazem o sync).
     if (!fromMe) {
       const phoneNormalized = normalizePhone(parsePhoneFromJid(jid));
@@ -401,7 +544,30 @@ export async function handleIncomingMessage(
           .update({ lead_id: leadResult.leadId, updated_at: new Date().toISOString() })
           .eq("id", conversationId)
           .is("lead_id", null);
+      }
 
+      // 5.a) ROGA-42 — Opt-out automático.
+      //
+      // Roda ANTES da progressão de estágio "Primeiro Contato → Respondeu"
+      // para que um lead que peça SAIR não seja erroneamente marcado como
+      // "Respondeu". Se o opt-out for acionado, encerramos o sync de CRM
+      // aqui: handleOptOut() já marcou o lead como "Perdido" e gravou o
+      // histórico apropriado.
+      const optedOut =
+        type === "text"
+          ? await handleOptOut({
+              accountId,
+              sock,
+              jid,
+              phoneNormalized,
+              body,
+              conversationId,
+              leadId: leadResult?.leadId ?? null,
+              timestampIso,
+            })
+          : false;
+
+      if (!optedOut && leadResult) {
         // Auto-move: Primeiro Contato -> Respondeu, só na PRIMEIRA resposta.
         // Guarda: lead atual = "Primeiro Contato" E ainda não há outra incoming
         // anterior nessa conversa (a INSERT acima ainda não conta porque foi
