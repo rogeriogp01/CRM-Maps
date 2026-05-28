@@ -8,3 +8,5 @@ build/
 .vercel/
 coverage/
 *.log
+sessions/
+creds.json
