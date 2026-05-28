@@ -376,9 +376,9 @@ export async function dispatchOneLead(input: DispatchInput): Promise<DispatchRes
       );
 
       const messageId: string | null =
-        (sendResult && typeof sendResult === "object" && "key" in sendResult
+        sendResult && typeof sendResult === "object" && "key" in sendResult
           ? (sendResult as { key?: { id?: string } }).key?.id ?? null
-          : null) ?? null;
+          : null;
 
       // Persiste sucesso
       await updateLeadDispatchStatus(lead.id, {
