@@ -1,3 +1,7 @@
+// TODO(ROGA-49): usar getCurrentWorkspaceId() de "@/lib/server/workspace"
+//   antes de filtrar/inserir em tabelas multi-tenant. Aguarda Fase 2
+//   (FK workspace_id) + Fase 3 (RLS) para migrar de forma segura.
+//   Ver ROGA-74 para o helper.
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/server/supabase-admin";
 import { markAlreadyContacted } from "@/lib/server/campaign-leads";
