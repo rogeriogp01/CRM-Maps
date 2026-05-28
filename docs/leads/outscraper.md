@@ -30,10 +30,11 @@ POST /api/leads/search
        │                                               ▼
        │             POST /api/leads/outscraper/webhook?token=...
        │                  (1) verifyWebhookToken + verifyHmacSignature
-       │                  (2) mapOutscraperWebhook  → NormalizedLead[]
-       │                  (3) persistNormalizedLeads → campaign_leads
-       │                  (4) recordUsage → lead_usage (cost tracking)
-       │                  (5) lead_jobs.update status=succeeded
+       │                  (2) lead_jobs lookup by request_id (campaign_id + reserved_cost)
+       │                  (3) mapOutscraperWebhook  → NormalizedLead[]
+       │                  (4) persistNormalizedLeads → campaign_leads (correct campaign)
+       │                  (5) settleReservation → lead_usage (cost reconciled)
+       │                  (6) lead_jobs.update status=succeeded
        │
        └── playwright ─▶ delegates to existing POST /api/extractor (streaming NDJSON)
 ```
@@ -81,9 +82,17 @@ POST /api/leads/search
    ```bash
    curl -X POST http://localhost:3000/api/leads/search \
      -H 'content-type: application/json' \
-     -d '{"query":"padaria","region":"SP","limit":50}'
+     -d '{
+       "query":"padaria",
+       "region":"São Paulo, SP",
+       "limit":50,
+       "campaignId":"<uuid>",
+       "regionCode":"br"
+     }'
    # → 202 { accepted, provider:"outscraper", jobId, estimatedCostCents }
    ```
+   - `campaignId` (optional): leads will land on this campaign. Without it they fall back to `DEFAULT_CAMPAIGN_ID` and have to be moved manually.
+   - `region` is appended to the Outscraper query for locality context AND interpreted as a 2-letter country code if it happens to be 2 characters. Pass `regionCode` explicitly (ISO-3166-1 alpha-2) when `region` is a free-text locality like `"São Paulo, SP"`.
 6. Watch the server log for `[outscraper/webhook] ok request=…` once Outscraper posts back. Leads land in `campaign_leads` with `source='outscraper'`.
 
 ## Tests
@@ -101,9 +110,13 @@ Runs all `src/lib/server/leads/__tests__/*.test.ts` via Node's built-in `node:te
 
 ## Cost guard semantics
 
-- **Persistent counter**: `lead_usage(provider, year_month, cost_usd_cents, ...)`. Atomic increment via `lead_usage_increment(...)` RPC — safe under concurrent webhook deliveries.
-- **Pre-submit check** in `OutscraperLeadSource.search()`: if `spent + (limit × OUTSCRAPER_COST_PER_LEAD_CENTS) > MAX_MONTHLY_LEAD_COST_USD × 100`, the call throws `CostGuardExceededError` (HTTP 429). **The job is never submitted to Outscraper.**
-- **Post-result reconciliation** in the webhook handler: increments `lead_usage` by `leads_received × OUTSCRAPER_COST_PER_LEAD_CENTS`. Idempotent on `request_id` (re-deliveries don't double-count cost; lead upsert is independently idempotent on `(campaign_id, phone_normalized)`).
+The guard enforces `cost + reserved + new_estimate ≤ limit` in a single round-trip via the `lead_usage_reserve` RPC, eliminating the check-then-submit race where two concurrent submits could both pass the limit check at the same `spent` value and end up overspending.
+
+- **Persistent counters**: `lead_usage(provider, year_month, cost_usd_cents, reserved_cents, ...)`. `cost_usd_cents` is settled spend; `reserved_cents` is budget held against in-flight jobs.
+- **Atomic reserve** (`OutscraperLeadSource.search()` → `lead_usage_reserve`): asserts `cost + reserved + estimated ≤ limit` inside a single UPDATE; raises `budget_exceeded` (mapped to `CostGuardExceededError` → HTTP 429) when it would overshoot. **The job is never submitted to Outscraper.** A `lead_jobs` audit row is written with status `rejected_by_guard` so the dashboard shows denied attempts.
+- **Settle** (webhook → `lead_usage_settle`): subtracts the reservation, adds the actual incurred cost (`leads_received × cost_per_lead_cents`). The per-lead price is read from the `lead_jobs` row (snapshot taken at submit) — not from the env — so a price/key rotation between submit and webhook does not desync the books.
+- **Release** (webhook on non-success status, or adapter on submit failure → `lead_usage_release`): drops the reservation without recording any cost. Prevents leaking budget when Outscraper rejects, times out, or the SDK call errors before the job is accepted.
+- **Idempotency**: re-deliveries of a `succeeded` webhook do NOT re-settle (`alreadyCounted` short-circuits both the cost record and any second release); campaign_leads upsert is independently idempotent on `(campaign_id, phone_normalized)`.
 - Reconcile monthly against the Outscraper invoice. Adjust `OUTSCRAPER_COST_PER_LEAD_CENTS` if the actual blended cost drifts.
 
 ## Rotating the API key

@@ -3,13 +3,24 @@ import { normalizePhone, isValidPhone } from "@/lib/phone";
 
 export const DEFAULT_CAMPAIGN_ID = "00000000-0000-0000-0000-000000000001";
 
-export type LeadSource = "crm" | "maps" | "csv" | "manual";
+// Mirror of campaign_leads.source CHECK constraint (see migration 014).
+// `outscraper` and `playwright` were added when the LeadSource interface
+// landed so we can stamp provider attribution on every row.
+export type LeadSource = "crm" | "maps" | "csv" | "manual" | "outscraper" | "playwright";
 
 export type CampaignLeadInput = {
   name?: string | null;
   phone: string;
   company?: string | null;
   tags?: string[] | null;
+  /** Postal address as the provider returned it. */
+  address?: string | null;
+  /** Place rating (0–5). */
+  rating?: number | null;
+  /** Place category (e.g. "padaria") — distinct from `company` (legal name). */
+  category?: string | null;
+  /** Google Place ID for cross-provider dedup. */
+  placeId?: string | null;
 };
 
 export type CampaignLeadRow = {
@@ -20,6 +31,10 @@ export type CampaignLeadRow = {
   phone_normalized: string;
   company: string | null;
   tags: string[] | null;
+  address: string | null;
+  rating: number | null;
+  category: string | null;
+  place_id: string | null;
   source: LeadSource;
   valid_whatsapp: boolean | null;
   already_contacted: boolean;
@@ -99,6 +114,10 @@ export async function bulkInsertLeads(params: {
     phone_normalized: p._norm,
     company: p.company ?? null,
     tags: p.tags ?? null,
+    address: p.address ?? null,
+    rating: p.rating ?? null,
+    category: p.category ?? null,
+    place_id: p.placeId ?? null,
     source: params.source,
   }));
 

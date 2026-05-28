@@ -1,33 +1,65 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  assertWithinBudget,
+  reserveBudget,
+  releaseReservation,
+  settleReservation,
   currentYearMonth,
   getConfiguredLimitCents,
-  recordUsage,
   type UsageStore,
 } from "../cost-guard";
 import { CostGuardExceededError } from "../types";
 
-function memoryStore(initial: Record<string, number> = {}): UsageStore & {
-  reads: number;
-  writes: { provider: string; yearMonth: string; costCents: number }[];
-  state: Record<string, number>;
+/**
+ * In-memory UsageStore that models the production semantics of
+ * lead_usage_reserve / settle / release atomically. Tests use it to check
+ * the application-level guard contract without standing up Supabase.
+ */
+function memoryStore(): UsageStore & {
+  state: Map<string, { cost: number; reserved: number; leads: number; jobs: number }>;
+  reserveCalls: number;
+  settleCalls: number;
+  releaseCalls: number;
 } {
-  const state = { ...initial };
-  const writes: { provider: string; yearMonth: string; costCents: number }[] = [];
+  const state = new Map<
+    string,
+    { cost: number; reserved: number; leads: number; jobs: number }
+  >();
+  const key = (p: string, ym: string) => `${p}:${ym}`;
+  const ensure = (p: string, ym: string) => {
+    const k = key(p, ym);
+    if (!state.has(k)) state.set(k, { cost: 0, reserved: 0, leads: 0, jobs: 0 });
+    return state.get(k)!;
+  };
   return {
     state,
-    reads: 0,
-    writes,
+    reserveCalls: 0,
+    settleCalls: 0,
+    releaseCalls: 0,
     async getMonthlySpentCents(provider, ym) {
-      this.reads++;
-      return state[`${provider}:${ym}`] ?? 0;
+      return ensure(provider, ym).cost;
     },
-    async increment({ provider, yearMonth, costCents }) {
-      writes.push({ provider, yearMonth, costCents });
-      const key = `${provider}:${yearMonth}`;
-      state[key] = (state[key] ?? 0) + costCents;
+    async reserve({ provider, yearMonth, estimatedCents, limitCents }) {
+      this.reserveCalls++;
+      const row = ensure(provider, yearMonth);
+      // Atomic check + bump, mirroring the RPC.
+      if (row.cost + row.reserved + estimatedCents > limitCents) {
+        throw new Error("budget_exceeded");
+      }
+      row.reserved += estimatedCents;
+    },
+    async settle({ provider, yearMonth, reservedCents, incurredCents, leadsCount, jobsCount }) {
+      this.settleCalls++;
+      const row = ensure(provider, yearMonth);
+      row.reserved = Math.max(0, row.reserved - reservedCents);
+      row.cost += incurredCents;
+      row.leads += leadsCount;
+      row.jobs += jobsCount;
+    },
+    async release({ provider, yearMonth, reservedCents }) {
+      this.releaseCalls++;
+      const row = ensure(provider, yearMonth);
+      row.reserved = Math.max(0, row.reserved - reservedCents);
     },
   };
 }
@@ -35,7 +67,6 @@ function memoryStore(initial: Record<string, number> = {}): UsageStore & {
 test("currentYearMonth returns UTC YYYY-MM", () => {
   const ym = currentYearMonth(new Date("2026-05-28T03:00:00Z"));
   assert.equal(ym, "2026-05");
-  // Edge: late UTC time on last day of month must not bleed into next month at local TZ.
   assert.equal(currentYearMonth(new Date("2026-12-31T23:59:59Z")), "2026-12");
 });
 
@@ -52,23 +83,26 @@ test("getConfiguredLimitCents reads env in dollars and converts to cents", () =>
   delete process.env.MAX_MONTHLY_LEAD_COST_USD;
 });
 
-test("assertWithinBudget passes when spent + estimated <= limit", async () => {
-  const store = memoryStore({ "outscraper:2026-05": 1000 });
-  const result = await assertWithinBudget({
+test("reserveBudget passes when cost + reserved + estimated <= limit", async () => {
+  const store = memoryStore();
+  // Pre-load $10 already-spent.
+  store.state.set("outscraper:2026-05", { cost: 1000, reserved: 0, leads: 0, jobs: 0 });
+  await reserveBudget({
     provider: "outscraper",
     estimatedCostCents: 2000,
     store,
     now: new Date("2026-05-28T12:00:00Z"),
     limitCents: 5000,
   });
-  assert.equal(result.spentCents, 1000);
-  assert.equal(result.limitCents, 5000);
+  // Reservation should be visible.
+  assert.equal(store.state.get("outscraper:2026-05")!.reserved, 2000);
 });
 
-test("assertWithinBudget throws CostGuardExceededError when spent + estimated > limit", async () => {
-  const store = memoryStore({ "outscraper:2026-05": 4500 });
+test("reserveBudget throws CostGuardExceededError when cost + reserved + estimated > limit", async () => {
+  const store = memoryStore();
+  store.state.set("outscraper:2026-05", { cost: 4500, reserved: 0, leads: 0, jobs: 0 });
   await assert.rejects(
-    assertWithinBudget({
+    reserveBudget({
       provider: "outscraper",
       estimatedCostCents: 1000, // 4500 + 1000 = 5500 > 5000
       store,
@@ -78,7 +112,6 @@ test("assertWithinBudget throws CostGuardExceededError when spent + estimated > 
     (err: unknown) => {
       assert.ok(err instanceof CostGuardExceededError, "should throw CostGuardExceededError");
       const e = err as CostGuardExceededError;
-      assert.equal(e.spentCents, 4500);
       assert.equal(e.estimatedCents, 1000);
       assert.equal(e.limitCents, 5000);
       assert.equal(e.provider, "outscraper");
@@ -87,59 +120,121 @@ test("assertWithinBudget throws CostGuardExceededError when spent + estimated > 
   );
 });
 
-test("assertWithinBudget tripping at exactly limit boundary keeps the guard strict (>)", async () => {
-  // spent + estimated == limit must pass (we only trip when it EXCEEDS).
-  const store = memoryStore({ "outscraper:2026-05": 4000 });
+test("reserveBudget closes the check-then-submit race against concurrent submits", async () => {
+  // Two concurrent reserves at spent=$48, est=$2 each, limit=$50.
+  // Naive check-then-submit would see spent=$48 + $2 ≤ $50 twice and let BOTH
+  // through, ending at $52 spent. The atomic reserve must let exactly one
+  // through (the second sees reserved=$2 already and trips).
+  const store = memoryStore();
+  store.state.set("outscraper:2026-05", { cost: 4800, reserved: 0, leads: 0, jobs: 0 });
+
+  const limitCents = 5000;
+  const reserve = (n: number) =>
+    reserveBudget({ provider: "outscraper", estimatedCostCents: 200, store, limitCents })
+      .then(() => `ok-${n}`)
+      .catch((err) => `fail-${n}-${(err as Error).constructor.name}`);
+
+  const results = await Promise.all([reserve(1), reserve(2)]);
+  const okCount = results.filter((r) => r.startsWith("ok-")).length;
+  const failCount = results.filter((r) => r.startsWith("fail-")).length;
+  assert.equal(okCount, 1, `exactly one reservation should succeed: ${results.join(",")}`);
+  assert.equal(failCount, 1, `the other must trip the guard: ${results.join(",")}`);
+  // Reserved budget should be only ONE job's worth, not both.
+  assert.equal(store.state.get("outscraper:2026-05")!.reserved, 200);
+});
+
+test("reserveBudget at exact limit boundary is allowed (<=, not <)", async () => {
+  const store = memoryStore();
+  store.state.set("outscraper:2026-05", { cost: 4000, reserved: 0, leads: 0, jobs: 0 });
   await assert.doesNotReject(
-    assertWithinBudget({
+    reserveBudget({
       provider: "outscraper",
       estimatedCostCents: 1000, // total 5000 == limit
       store,
-      now: new Date("2026-05-28T12:00:00Z"),
       limitCents: 5000,
     })
   );
 });
 
-test("recordUsage increments the store with the requested amounts", async () => {
+test("settleReservation swaps reservation for incurred cost", async () => {
   const store = memoryStore();
-  await recordUsage({
+  await reserveBudget({
     provider: "outscraper",
-    costCents: 200,
-    leadsCount: 100,
-    requestId: "req-1",
+    estimatedCostCents: 1000,
     store,
-    now: new Date("2026-05-28T12:00:00Z"),
+    limitCents: 5000,
   });
-  assert.equal(store.state["outscraper:2026-05"], 200);
-  assert.equal(store.writes.length, 1);
-  assert.equal(store.writes[0].costCents, 200);
+  // Job came back with fewer leads than the cap → actual cost < reservation.
+  await settleReservation({
+    provider: "outscraper",
+    reservedCents: 1000,
+    incurredCents: 720,
+    leadsCount: 36,
+    store,
+    requestId: "req-1",
+  });
+  const row = store.state.get("outscraper:2026-05")!;
+  assert.equal(row.reserved, 0, "reservation drained");
+  assert.equal(row.cost, 720, "actual cost recorded");
 });
 
-test("recordUsage + assertWithinBudget compose to enforce the cap across multiple jobs", async () => {
+test("releaseReservation returns held budget without recording cost (on job failure)", async () => {
   const store = memoryStore();
-  // Spend 30 jobs of $0.20 each = $6.00 = 600 cents, well under $50.
-  for (let i = 0; i < 30; i++) {
-    await recordUsage({ provider: "outscraper", costCents: 20, leadsCount: 10, store });
+  await reserveBudget({
+    provider: "outscraper",
+    estimatedCostCents: 1500,
+    store,
+    limitCents: 5000,
+  });
+  await releaseReservation({
+    provider: "outscraper",
+    reservedCents: 1500,
+    store,
+    requestId: "req-2",
+  });
+  const row = store.state.get("outscraper:2026-05")!;
+  assert.equal(row.reserved, 0, "reservation released");
+  assert.equal(row.cost, 0, "no cost recorded for the failed job");
+});
+
+test("reserve+settle compose: budget held across many jobs cannot exceed limit", async () => {
+  const store = memoryStore();
+  const limitCents = 5000;
+  // Try 60 reservations of $1 (100 cents) each — first 50 succeed, rest reject.
+  const outcomes: string[] = [];
+  for (let i = 0; i < 60; i++) {
+    try {
+      await reserveBudget({
+        provider: "outscraper",
+        estimatedCostCents: 100,
+        store,
+        limitCents,
+      });
+      outcomes.push("ok");
+    } catch (err) {
+      outcomes.push((err as Error).constructor.name);
+    }
   }
-  // Total now: 600 cents. Limit: 5000. Add a $44 job → spent 4400+600=5000? Wait:
-  // We've spent 600, so an estimated 4500 job → 5100 > 5000 should trip.
+  const okCount = outcomes.filter((o) => o === "ok").length;
+  assert.equal(okCount, 50, "exactly limit/cost jobs may reserve");
+  const row = store.state.get("outscraper:2026-05")!;
+  assert.equal(row.reserved, 5000);
+  // Settle them all at the full estimate.
+  for (let i = 0; i < 50; i++) {
+    await settleReservation({
+      provider: "outscraper",
+      reservedCents: 100,
+      incurredCents: 100,
+      leadsCount: 1,
+      store,
+    });
+  }
+  const after = store.state.get("outscraper:2026-05")!;
+  assert.equal(after.reserved, 0);
+  assert.equal(after.cost, 5000);
+  // Now even a single $0.01 job must trip the guard.
   await assert.rejects(
-    assertWithinBudget({
-      provider: "outscraper",
-      estimatedCostCents: 4500,
-      store,
-      limitCents: 5000,
-    }),
+    reserveBudget({ provider: "outscraper", estimatedCostCents: 1, store, limitCents }),
     CostGuardExceededError
-  );
-  // But an estimated 4300 → 4900 ≤ 5000 should pass.
-  await assert.doesNotReject(
-    assertWithinBudget({
-      provider: "outscraper",
-      estimatedCostCents: 4300,
-      store,
-      limitCents: 5000,
-    })
   );
 });

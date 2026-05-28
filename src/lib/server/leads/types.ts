@@ -33,12 +33,29 @@ export interface NormalizedLead {
 export interface LeadSearchInput {
   /** Free-text query (e.g. "padaria"). */
   query: string;
-  /** Region/locality string (e.g. "São Paulo, SP"). */
+  /**
+   * Region/locality string (e.g. "São Paulo, SP"). NOTE: this field does
+   * double-duty for Outscraper today — it is appended to the query for
+   * locality context AND interpreted as an ISO-3166-1 alpha-2 country code
+   * if it happens to be 2 letters (otherwise defaults to "br"). Callers
+   * passing things like "SP" thinking they mean the state will get
+   * country-level Brazil. To override the country hint explicitly, set
+   * `regionCode`.
+   */
   region: string;
+  /** Optional ISO-3166-1 alpha-2 country code override (e.g. "br", "us"). */
+  regionCode?: string;
   /** Hard cap on number of leads to fetch. */
   limit: number;
   /** Optional language hint for the provider. Defaults to "pt" / "br". */
   language?: string;
+  /**
+   * Target campaign for the leads delivered by this search. Persisted on the
+   * `lead_jobs` row at submit time and looked up by the webhook so leads land
+   * on the right campaign (rather than always falling through to
+   * `DEFAULT_CAMPAIGN_ID`). Omit to use the default campaign.
+   */
+  campaignId?: string;
 }
 
 /**

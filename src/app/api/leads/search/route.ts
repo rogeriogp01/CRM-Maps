@@ -15,10 +15,25 @@ export const dynamic = "force-dynamic";
  *     existing /api/extractor streaming endpoint so the UI can be kept
  *     identical during rollback.
  *
- * Body: { query: string, region: string, limit?: number, language?: string }
+ * Body: {
+ *   query: string,
+ *   region: string,
+ *   limit?: number,
+ *   language?: string,
+ *   campaignId?: string,
+ *   regionCode?: string,  // ISO-3166-1 alpha-2 country hint, overrides the
+ *                         //   double-duty interpretation of `region`.
+ * }
  */
 export async function POST(request: Request) {
-  let body: { query?: unknown; region?: unknown; limit?: unknown; language?: unknown };
+  let body: {
+    query?: unknown;
+    region?: unknown;
+    limit?: unknown;
+    language?: unknown;
+    campaignId?: unknown;
+    regionCode?: unknown;
+  };
   try {
     body = await request.json();
   } catch {
@@ -58,6 +73,8 @@ export async function POST(request: Request) {
       region: body.region,
       limit,
       language: typeof body.language === "string" ? body.language : undefined,
+      regionCode: typeof body.regionCode === "string" ? body.regionCode : undefined,
+      campaignId: typeof body.campaignId === "string" ? body.campaignId : undefined,
     });
 
     if (result.kind === "async") {
