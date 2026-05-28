@@ -22,6 +22,7 @@ import {
   DEFAULT_OPT_OUT_KEYWORDS,
   DEFAULT_OPT_OUT_CONFIRMATION,
 } from "@/lib/server/system-settings";
+import { appendInboxMessageHistory } from "@/lib/server/crm-history";
 
 type IncomingMsgType =
   | "text"
@@ -134,16 +135,21 @@ function previewFor(type: IncomingMsgType, body: string | null): string {
 /**
  * Find-or-create conversa por (account_id, contact_jid).
  * Atualiza contact_name se ele estava vazio e veio pushName novo.
+ *
+ * Retorna { id, leadId } — `leadId` pode vir nulo se a conversa for
+ * antiga (anterior ao trigger ensure_lead_for_conversation da migration
+ * 011) ou se o telefone for invalido para resolver lead. O caller deve
+ * tentar `resolveOrCreateLead` quando `leadId` vier nulo.
  */
 async function findOrCreateConversation(
   accountId: string,
   jid: string,
   pushName: string | null
-): Promise<string> {
+): Promise<{ id: string; leadId: string | null }> {
   // 1) tenta encontrar
   const { data: existing } = await supabaseAdmin
     .from("chat_conversations")
-    .select("id, contact_name")
+    .select("id, contact_name, lead_id")
     .eq("account_id", accountId)
     .eq("contact_jid", jid)
     .maybeSingle();
@@ -155,10 +161,11 @@ async function findOrCreateConversation(
         .update({ contact_name: pushName, updated_at: new Date().toISOString() })
         .eq("id", existing.id);
     }
-    return existing.id;
+    return { id: existing.id, leadId: existing.lead_id ?? null };
   }
 
-  // 2) cria
+  // 2) cria. O trigger ensure_lead_for_conversation (migration 011) preenche
+  //    lead_id no BEFORE INSERT, entao o select abaixo ja devolve o lead.
   const { data: created, error } = await supabaseAdmin
     .from("chat_conversations")
     .insert({
@@ -166,12 +173,79 @@ async function findOrCreateConversation(
       contact_jid: jid,
       contact_name: pushName,
     })
-    .select("id")
+    .select("id, lead_id")
     .single();
 
   if (error || !created) {
     throw new Error(`Falha ao criar conversa: ${error?.message ?? "unknown"}`);
   }
+  return { id: created.id, leadId: created.lead_id ?? null };
+}
+
+/**
+ * resolveOrCreateLead — defesa em profundidade no app.
+ *
+ * Para conversas antigas (anteriores ao trigger de 011) ou casos em que
+ * o trigger nao conseguiu derivar o phone_normalized, o app tambem
+ * resolve/cria o lead a partir do telefone normalizado.
+ *
+ * Retorna o leadId, ou null se o telefone for invalido / criacao falhou.
+ *
+ * Assinatura segue o plano de ROGA-36.2:
+ *   resolveOrCreateLead(phone, phone_normalized, whatsapp_account_id, display_name)
+ */
+export async function resolveOrCreateLead(
+  phone: string | null,
+  phoneNormalized: string,
+  whatsappAccountId: string | null,
+  displayName: string | null
+): Promise<string | null> {
+  if (!phoneNormalized || phoneNormalized.length < 8) return null;
+
+  const { data: existing } = await supabaseAdmin
+    .from("crm_leads")
+    .select("id")
+    .eq("phone_normalized", phoneNormalized)
+    .maybeSingle();
+
+  if (existing?.id) return existing.id;
+
+  const { data: created, error } = await supabaseAdmin
+    .from("crm_leads")
+    .insert({
+      name: displayName ?? phoneNormalized,
+      phone: phone ?? phoneNormalized,
+      phone_normalized: phoneNormalized,
+      origin: "inbox",
+      status: "Novo Lead",
+      whatsapp_account_id: whatsappAccountId,
+      last_interaction_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error || !created) {
+    // Pode ter perdido a race contra o trigger — relookup.
+    const { data: refetched } = await supabaseAdmin
+      .from("crm_leads")
+      .select("id")
+      .eq("phone_normalized", phoneNormalized)
+      .maybeSingle();
+    if (refetched?.id) return refetched.id;
+    console.error(
+      "[inbox] resolveOrCreateLead: insert failed:",
+      error?.message ?? "unknown"
+    );
+    return null;
+  }
+
+  await appendCrmHistory({
+    lead_id: created.id,
+    type: "lead_created",
+    message: "Lead criado automaticamente pelo Inbox (defesa em profundidade)",
+    whatsapp_account_id: whatsappAccountId,
+  });
+
   return created.id;
 }
 
@@ -451,7 +525,35 @@ export async function handleIncomingMessage(
     if (type === "unknown" && !body && !mediaKey) return;
 
     // 1) Conversa
-    const conversationId = await findOrCreateConversation(accountId, jid, pushName);
+    const { id: conversationId, leadId: convLeadIdFromTrigger } =
+      await findOrCreateConversation(accountId, jid, pushName);
+
+    // 1.b) Defesa em profundidade — se a conversa nao tem lead_id (caso
+    //      de conversas antigas, anteriores ao trigger da migration 011,
+    //      ou se o trigger nao conseguiu derivar phone_normalized),
+    //      tentamos resolver/criar o lead no app e linkar a conversa.
+    const phoneFromJid = parsePhoneFromJid(jid);
+    const phoneNormalized = normalizePhone(phoneFromJid);
+
+    let resolvedLeadId: string | null = convLeadIdFromTrigger;
+    if (!resolvedLeadId && phoneNormalized.length >= 8) {
+      resolvedLeadId = await resolveOrCreateLead(
+        phoneFromJid,
+        phoneNormalized,
+        accountId,
+        pushName
+      );
+      if (resolvedLeadId) {
+        await supabaseAdmin
+          .from("chat_conversations")
+          .update({
+            lead_id: resolvedLeadId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", conversationId)
+          .is("lead_id", null);
+      }
+    }
 
     // 2) Mídia (só se for um tipo com mediaKey e socket disponível)
     let mediaUrl: string | null = null;
@@ -477,7 +579,7 @@ export async function handleIncomingMessage(
     }
 
     // 3) Upsert da mensagem (dedupe outgoing echo)
-    const { error: upsertErr } = await supabaseAdmin
+    const { data: upserted, error: upsertErr } = await supabaseAdmin
       .from("chat_messages")
       .upsert(
         {
@@ -493,10 +595,34 @@ export async function handleIncomingMessage(
           timestamp: timestampIso,
         },
         { onConflict: "conversation_id,baileys_message_id", ignoreDuplicates: false }
-      );
+      )
+      .select("id")
+      .single();
     if (upsertErr) {
       console.error("[inbox] upsert message failed:", upsertErr.message);
       return;
+    }
+    const chatMessageUuid: string | null = upserted?.id ?? null;
+
+    // 3.b) crm_history.inbox_message — emite para CADA chat_messages persistida
+    //      com lead_id resolvido (defesa em profundidade — espelha trigger
+    //      futuro ou eventos perdidos). Idempotente via source_message_id
+    //      (uuid de chat_messages.id, nao o baileys_message_id texto).
+    //      Best-effort: nao bloqueia o fluxo se falhar.
+    if (resolvedLeadId && chatMessageUuid) {
+      await appendInboxMessageHistory({
+        leadId: resolvedLeadId,
+        messageId: chatMessageUuid,
+        direction: fromMe ? "out" : "in",
+        whatsappAccountId: accountId,
+        preview: previewFor(type, body),
+        createdAt: timestampIso,
+        metadata: {
+          source: "inbox.handleIncomingMessage",
+          type,
+          baileys_message_id: messageId,
+        },
+      });
     }
 
     // 4) Atualiza preview/last_message_at; incrementa unread só se !fromMe.
@@ -534,16 +660,43 @@ export async function handleIncomingMessage(
     // 5) Sync CRM + opt-out: SOMENTE para mensagens recebidas (incoming).
     //    Outgoing echo não toca no CRM (o disparador e a rota POST já fazem o sync).
     if (!fromMe) {
-      const phoneNormalized = normalizePhone(parsePhoneFromJid(jid));
-      const leadResult = await findOrCreateLead(phoneNormalized, pushName, accountId);
-
-      if (leadResult) {
-        // Link conversa -> lead (se ainda não estiver)
-        await supabaseAdmin
-          .from("chat_conversations")
-          .update({ lead_id: leadResult.leadId, updated_at: new Date().toISOString() })
-          .eq("id", conversationId)
-          .is("lead_id", null);
+      // O lead ja foi resolvido acima (defesa em profundidade). Para manter
+      // a logica original do auto-move "Primeiro Contato -> Respondeu",
+      // precisamos do status atual do lead.
+      let leadResult: {
+        leadId: string;
+        wasCreated: boolean;
+        currentStatus: string;
+      } | null = null;
+      if (resolvedLeadId) {
+        const { data: leadRow } = await supabaseAdmin
+          .from("crm_leads")
+          .select("status")
+          .eq("id", resolvedLeadId)
+          .maybeSingle();
+        leadResult = leadRow
+          ? {
+              leadId: resolvedLeadId,
+              // wasCreated=false aqui — se acabou de ser criado, o status sera
+              // "Novo Lead", e o ramo do auto-move ja exige "Primeiro Contato".
+              wasCreated: false,
+              currentStatus: leadRow.status,
+            }
+          : null;
+      } else if (phoneNormalized.length >= 8) {
+        // Fallback historico — phone normalizado existe mas resolveOrCreateLead
+        // acima falhou. Tenta o helper antigo para preservar o caminho legado.
+        leadResult = await findOrCreateLead(phoneNormalized, pushName, accountId);
+        if (leadResult) {
+          await supabaseAdmin
+            .from("chat_conversations")
+            .update({
+              lead_id: leadResult.leadId,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", conversationId)
+            .is("lead_id", null);
+        }
       }
 
       // 5.a) ROGA-42 — Opt-out automático.

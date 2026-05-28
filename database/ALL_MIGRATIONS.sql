@@ -382,6 +382,23 @@ begin
 end $$;
 
 -- ============================================================
+-- 013: crm_history.metadata (jsonb)
+-- ROGA-52 (ROGA-36.2)
+--
+-- Adiciona coluna metadata jsonb em crm_history para que o helper
+-- appendInboxMessageHistory possa registrar direction ('in' | 'out')
+-- e campos extras junto de eventos `inbox_message`, sem codificar
+-- esses metadados dentro de `message` (texto livre).
+-- ============================================================
+
+-- TODO RLS: revisar policies de crm_history em ROGA-RLS.
+alter table public.crm_history
+  add column if not exists metadata jsonb;
+
+create index if not exists crm_history_metadata_gin_idx
+  on public.crm_history using gin (metadata);
+
+-- ============================================================
 -- Final: reload PostgREST schema cache
 -- ============================================================
 notify pgrst, 'reload schema';

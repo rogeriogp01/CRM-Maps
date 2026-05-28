@@ -19,6 +19,7 @@ import { isValidPhone, toJid } from "@/lib/phone";
 import { getNextAvailableWhatsapp } from "@/lib/dispatch-rotation";
 import { getSocket } from "@/lib/whatsapp-manager";
 import { appendCrmHistory } from "@/lib/crm";
+import { appendInboxMessageHistory } from "@/lib/server/crm-history";
 
 const SEND_TIMEOUT_MS = 15_000;
 const MAX_ACCOUNT_ATTEMPTS = 3;
@@ -106,13 +107,67 @@ async function recordHistory(params: {
   }
 }
 
+/**
+ * ROGA-52 — emite crm_history.inbox_message direction='out' depois de um
+ * envio bem-sucedido pelo dispatcher.
+ *
+ * Defesa em profundidade: o echo do Baileys (handleIncomingMessage com
+ * fromMe=true) ja vai inserir o chat_messages e emitir o history, mas:
+ *   - O echo pode demorar / nao chegar em sessoes intermitentes.
+ *   - Pode haver bypass do echo em testes.
+ *
+ * Como source_message_id e UNIQUE parcial, chamar duas vezes (uma aqui e
+ * outra no echo) e idempotente.
+ *
+ * messageId aqui e o baileys text id; precisamos do uuid de chat_messages.
+ * Se a linha ainda nao foi inserida pelo echo, simplesmente pulamos — o
+ * echo vai cobrir.
+ *
+ * Best-effort: NUNCA bloqueia o fluxo de envio.
+ */
+async function emitDispatchOutboundHistory(params: {
+  leadId: string;
+  baileysMessageId: string | null;
+  accountId: string;
+  preview: string;
+}): Promise<void> {
+  try {
+    if (!params.baileysMessageId) return;
+
+    const { data: row } = await supabaseAdmin
+      .from("chat_messages")
+      .select("id, conversation_id")
+      .eq("baileys_message_id", params.baileysMessageId)
+      .maybeSingle();
+
+    if (!row?.id) {
+      // Echo ainda nao chegou: deixa para o inbox handler emitir.
+      return;
+    }
+
+    await appendInboxMessageHistory({
+      leadId: params.leadId,
+      messageId: row.id,
+      direction: "out",
+      whatsappAccountId: params.accountId,
+      preview: params.preview,
+      metadata: {
+        source: "dispatch.dispatchOneLead",
+        baileys_message_id: params.baileysMessageId,
+      },
+    });
+  } catch (err) {
+    console.error("[dispatch] emitDispatchOutboundHistory failed:", err);
+  }
+}
+
 async function syncCrm(params: {
   phoneNormalized: string;
   renderedMessage: string;
   status: "sent" | "failed";
   error: string | null;
   accountId: string | null;
-}): Promise<void> {
+}): Promise<string | null> {
   try {
     const { data: leadRow } = await supabaseAdmin
       .from("crm_leads")
@@ -120,7 +175,7 @@ async function syncCrm(params: {
       .eq("phone", params.phoneNormalized)
       .maybeSingle();
 
-    if (!leadRow?.id) return;
+    if (!leadRow?.id) return null;
 
     await supabaseAdmin
       .from("crm_leads")
@@ -136,8 +191,11 @@ async function syncCrm(params: {
       message: `${params.renderedMessage}${params.error ? ` | erro: ${params.error}` : ""}`,
       whatsapp_account_id: params.accountId ?? undefined,
     });
+
+    return leadRow.id;
   } catch (err) {
     console.error("[dispatch] crm sync failed:", err);
+    return null;
   }
 }
 
@@ -297,13 +355,24 @@ export async function dispatchOneLead(input: DispatchInput): Promise<DispatchRes
         error: null,
       });
 
-      await syncCrm({
+      const syncedLeadId = await syncCrm({
         phoneNormalized: lead.phone_normalized,
         renderedMessage,
         status: "sent",
         error: null,
         accountId: account.id,
       });
+
+      // ROGA-52 — emite crm_history.inbox_message direction=out (defesa em
+      // profundidade, idempotente via source_message_id). Best-effort.
+      if (syncedLeadId && messageId) {
+        await emitDispatchOutboundHistory({
+          leadId: syncedLeadId,
+          baileysMessageId: messageId,
+          accountId: account.id,
+          preview: renderedMessage.slice(0, 80),
+        });
+      }
 
       return {
         ok: true,
