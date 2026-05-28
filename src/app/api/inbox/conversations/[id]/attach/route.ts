@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/server/supabase-admin";
 import { getSocket } from "@/lib/whatsapp-manager";
 import { recordOutgoingMessage } from "@/lib/server/inbox";
+import {
+  CHAT_MEDIA_BUCKET,
+  signChatMediaUrl,
+} from "@/lib/server/chat-media";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -73,17 +77,17 @@ export async function POST(request: Request, { params }: RouteParams) {
   const mime = file.type || "application/octet-stream";
   const ext = extensionForMime(mime);
 
-  // Upload no Storage
+  // Upload no Storage (bucket privado — ROGA-35).
+  // Persistimos o STORAGE PATH em `chat_messages.media_url`; a URL exposta
+  // ao cliente é uma signed URL gerada na hora.
   const tempId = `out_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const storagePath = `${conv.account_id}/${tempId}.${ext}`;
   const { error: upErr } = await supabaseAdmin.storage
-    .from("chat-media")
+    .from(CHAT_MEDIA_BUCKET)
     .upload(storagePath, buffer, { contentType: mime, upsert: true });
   if (upErr) {
     return NextResponse.json({ error: `Upload falhou: ${upErr.message}` }, { status: 500 });
   }
-  const { data: pub } = supabaseAdmin.storage.from("chat-media").getPublicUrl(storagePath);
-  const publicUrl = pub?.publicUrl ?? null;
 
   // Envia via Baileys
   const { baileysKey, type } = detectKindFromMime(mime);
@@ -107,16 +111,19 @@ export async function POST(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Envio sem messageId" }, { status: 500 });
     }
 
+    // Persistimos o storage path (ROGA-35). O response devolve uma signed URL
+    // fresca para a UI conseguir renderizar imediatamente o eco da mensagem.
     await recordOutgoingMessage({
       conversationId: conv.id,
       baileysMessageId: messageId,
       type,
       body: caption,
-      mediaUrl: publicUrl,
+      mediaUrl: storagePath,
       mediaMime: mime,
     });
 
-    return NextResponse.json({ ok: true, messageId, mediaUrl: publicUrl });
+    const signedUrl = await signChatMediaUrl(storagePath);
+    return NextResponse.json({ ok: true, messageId, mediaUrl: signedUrl });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });

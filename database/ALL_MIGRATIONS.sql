@@ -1,5 +1,5 @@
 -- ============================================================
--- ALL MIGRATIONS COMBINED (001 → 008)
+-- ALL MIGRATIONS COMBINED (001 → 010)
 -- Idempotente: seguro para rodar múltiplas vezes.
 -- ============================================================
 
@@ -271,6 +271,44 @@ begin
   end if;
   create policy "chat-media public read" on storage.objects
     for select using (bucket_id = 'chat-media');
+end $$;
+
+-- ============================================================
+-- 010: chat-media privado + signed URLs (ROGA-35)
+-- Sobrescreve a config pública criada em 008.
+-- ============================================================
+update storage.buckets
+   set public = false
+ where id = 'chat-media';
+
+do $$
+begin
+  if exists (
+    select 1 from pg_policies
+     where schemaname = 'storage'
+       and tablename = 'objects'
+       and policyname = 'chat-media public read'
+  ) then
+    drop policy "chat-media public read" on storage.objects;
+  end if;
+end $$;
+
+do $$
+begin
+  if exists (
+    select 1 from pg_policies
+     where schemaname = 'storage'
+       and tablename = 'objects'
+       and policyname = 'chat-media authenticated read'
+  ) then
+    drop policy "chat-media authenticated read" on storage.objects;
+  end if;
+  create policy "chat-media authenticated read" on storage.objects
+    for select
+    using (
+      bucket_id = 'chat-media'
+      and auth.uid() is not null
+    );
 end $$;
 
 -- ============================================================

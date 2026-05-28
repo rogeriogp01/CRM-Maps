@@ -15,6 +15,7 @@
  */
 
 import { supabaseAdmin } from "@/lib/server/supabase-admin";
+import { CHAT_MEDIA_BUCKET } from "@/lib/server/chat-media";
 import { normalizePhone, appendCrmHistory } from "@/lib/crm";
 
 type IncomingMsgType =
@@ -221,7 +222,13 @@ async function findOrCreateLead(
 }
 
 /**
- * Sobe mídia para o bucket chat-media e devolve URL pública.
+ * Sobe mídia para o bucket privado `chat-media` e devolve o **storage path**.
+ *
+ * IMPORTANTE (ROGA-35): o bucket é privado. NÃO retornamos `getPublicUrl`
+ * porque seria 403 ao cliente. O path é persistido em
+ * `chat_messages.media_url`; signed URLs são geradas no momento da leitura
+ * via `signChatMediaUrl` (ver `@/lib/server/chat-media`).
+ *
  * Retorna null em caso de falha — a mensagem é salva sem media_url.
  */
 async function uploadMedia(params: {
@@ -236,7 +243,7 @@ async function uploadMedia(params: {
     const path = `${params.accountId}/${safeId}.${ext}`;
 
     const { error: upErr } = await supabaseAdmin.storage
-      .from("chat-media")
+      .from(CHAT_MEDIA_BUCKET)
       .upload(path, params.buffer, {
         contentType: params.mime,
         upsert: true,
@@ -246,8 +253,7 @@ async function uploadMedia(params: {
       return null;
     }
 
-    const { data: pub } = supabaseAdmin.storage.from("chat-media").getPublicUrl(path);
-    return pub?.publicUrl ?? null;
+    return path;
   } catch (err) {
     console.error("[inbox] uploadMedia exception:", err);
     return null;
@@ -310,8 +316,11 @@ export async function handleIncomingMessage(
     // 1) Conversa
     const conversationId = await findOrCreateConversation(accountId, jid, pushName);
 
-    // 2) Mídia (só se for um tipo com mediaKey e socket disponível)
-    let mediaUrl: string | null = null;
+    // 2) Mídia (só se for um tipo com mediaKey e socket disponível).
+    // mediaPath é o storage path no bucket privado `chat-media` (ROGA-35).
+    // É persistido em `chat_messages.media_url` e convertido em signed URL
+    // no momento da leitura pelo endpoint que serve mensagens ao cliente.
+    let mediaPath: string | null = null;
     if (mediaKey && sock) {
       try {
         // Baileys: downloadMediaMessage é exportado do pacote.
@@ -320,7 +329,7 @@ export async function handleIncomingMessage(
         if (typeof downloadMediaMessage === "function") {
           const buffer: Buffer = await downloadMediaMessage(msg, "buffer", {});
           if (buffer && buffer.length > 0) {
-            mediaUrl = await uploadMedia({
+            mediaPath = await uploadMedia({
               accountId,
               messageId,
               buffer,
@@ -344,7 +353,7 @@ export async function handleIncomingMessage(
           from_me: fromMe,
           type,
           body,
-          media_url: mediaUrl,
+          media_url: mediaPath,
           media_mime: mime,
           status: fromMe ? "sent" : null,
           timestamp: timestampIso,
@@ -457,11 +466,17 @@ export async function handleIncomingMessage(
 
 // Helper exportado para a rota POST registrar mensagem outgoing
 // imediatamente após sock.sendMessage (antes do echo do messages.upsert).
+//
+// ROGA-35: `mediaUrl` aqui é o **storage path** no bucket privado
+// `chat-media` (ex.: `acc-123/out_xxx.jpg`), NÃO uma URL pública. O nome
+// do parâmetro está preservado por compatibilidade — quem produz o valor
+// é o callsite (route handler `attach`), que faz o upload e devolve o path.
 export async function recordOutgoingMessage(params: {
   conversationId: string;
   baileysMessageId: string;
   type: IncomingMsgType;
   body: string | null;
+  /** Storage path no bucket privado chat-media (ou null se for texto puro). */
   mediaUrl: string | null;
   mediaMime: string | null;
   timestampMs?: number;

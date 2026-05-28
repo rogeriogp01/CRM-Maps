@@ -3,6 +3,7 @@
 import { FileText } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AudioPlayer } from "./AudioPlayer";
+import { useSignedMediaUrl } from "./useSignedMediaUrl";
 import type { MessageRow } from "./InboxModule";
 
 type Props = {
@@ -23,6 +24,13 @@ function formatTime(iso: string) {
 export function MessageBubble({ msg }: Props) {
   const isOut = msg.direction === "out";
 
+  // ROGA-35: `msg.media_url` pode chegar como storage path (Realtime/INSERT,
+  // banco) ou como URL HTTPS (resposta de endpoint que já assinou). O hook
+  // distingue e gera signed URL quando necessário, cacheando até o TTL.
+  const { url: signedMediaUrl, loading: mediaLoading } = useSignedMediaUrl(msg.media_url);
+
+  const hasMedia = !!signedMediaUrl;
+
   return (
     <div className={cn("flex", isOut ? "justify-end" : "justify-start")}>
       <div
@@ -34,31 +42,31 @@ export function MessageBubble({ msg }: Props) {
         )}
       >
         {/* Render por tipo */}
-        {msg.type === "image" && msg.media_url && (
-          <a href={msg.media_url} target="_blank" rel="noreferrer">
+        {msg.type === "image" && hasMedia && (
+          <a href={signedMediaUrl!} target="_blank" rel="noreferrer">
             <img
-              src={msg.media_url}
+              src={signedMediaUrl!}
               alt={msg.body ?? "imagem"}
               className="rounded-lg max-w-full mb-1"
             />
           </a>
         )}
 
-        {msg.type === "video" && msg.media_url && (
+        {msg.type === "video" && hasMedia && (
           <video
-            src={msg.media_url}
+            src={signedMediaUrl!}
             controls
             className="rounded-lg max-w-full mb-1"
           />
         )}
 
-        {msg.type === "audio" && msg.media_url && (
-          <AudioPlayer src={msg.media_url} isOut={isOut} />
+        {msg.type === "audio" && hasMedia && (
+          <AudioPlayer src={signedMediaUrl!} isOut={isOut} />
         )}
 
-        {msg.type === "document" && msg.media_url && (
+        {msg.type === "document" && hasMedia && (
           <a
-            href={msg.media_url}
+            href={signedMediaUrl!}
             target="_blank"
             rel="noreferrer"
             className={cn(
@@ -71,12 +79,23 @@ export function MessageBubble({ msg }: Props) {
           </a>
         )}
 
-        {msg.type === "sticker" && msg.media_url && (
+        {msg.type === "sticker" && hasMedia && (
           <img
-            src={msg.media_url}
+            src={signedMediaUrl!}
             alt="figurinha"
             className="w-24 h-24 object-contain"
           />
+        )}
+
+        {/* Estado de loading da mídia: msg tem media_url mas ainda não assinou.
+            Mostra placeholder discreto em vez de quebrar o layout. */}
+        {!hasMedia && mediaLoading && msg.media_url && msg.type !== "text" && (
+          <p className="italic opacity-60 text-xs">[carregando mídia…]</p>
+        )}
+
+        {/* Falha ao assinar (path inválido, objeto removido, etc). */}
+        {!hasMedia && !mediaLoading && msg.media_url && msg.type !== "text" && (
+          <p className="italic opacity-60 text-xs">[mídia indisponível]</p>
         )}
 
         {/* Texto / caption */}

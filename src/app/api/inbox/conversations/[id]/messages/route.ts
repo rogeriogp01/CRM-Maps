@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/server/supabase-admin";
 import { getSocket } from "@/lib/whatsapp-manager";
 import { recordOutgoingMessage } from "@/lib/server/inbox";
+import { attachSignedMediaUrls } from "@/lib/server/chat-media";
 
 type RouteParams = { params: Promise<{ id: string }> };
 
@@ -36,7 +37,14 @@ export async function GET(request: Request, { params }: RouteParams) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  return NextResponse.json({ messages: (data ?? []).reverse() });
+  // ROGA-35: `media_url` no banco guarda o storage path do bucket privado
+  // `chat-media`. Convertemos em signed URL antes de devolver ao cliente.
+  // `attachSignedMediaUrls` é resiliente a linhas legadas que ainda têm
+  // URL pública (extrai o path e re-assina).
+  const ordered = (data ?? []).reverse();
+  const messages = await attachSignedMediaUrls(ordered);
+
+  return NextResponse.json({ messages });
 }
 
 /**
