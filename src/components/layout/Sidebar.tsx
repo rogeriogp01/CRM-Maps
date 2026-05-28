@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -14,6 +14,7 @@ import {
   LogOut,
   Menu,
   MessageCircle,
+  User as UserIcon,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -28,9 +29,27 @@ const menuItems = [
   { icon: Settings, label: "Configurações", href: "/configuracoes" },
 ];
 
-export function Sidebar() {
+type SidebarProps = {
+  userName?: string;
+  userEmail?: string;
+};
+
+export function Sidebar({ userName, userEmail }: SidebarProps) {
   const pathname = usePathname();
+  const router = useRouter();
   const [isOpen, setIsOpen] = useState(true);
+  const [isSigningOut, setIsSigningOut] = useState(false);
+
+  const handleLogout = async () => {
+    if (isSigningOut) return;
+    setIsSigningOut(true);
+    try {
+      await fetch("/api/auth/signout", { method: "POST" });
+    } finally {
+      router.replace("/login");
+      router.refresh();
+    }
+  };
 
   return (
     <aside
@@ -50,6 +69,7 @@ export function Sidebar() {
           <button
             onClick={() => setIsOpen(!isOpen)}
             className="p-2 rounded-md hover:bg-accent transition-colors"
+            aria-label="Toggle sidebar"
           >
             <Menu size={20} />
           </button>
@@ -78,16 +98,45 @@ export function Sidebar() {
           })}
         </nav>
 
-        {/* Footer */}
-        <div className="p-4 border-t border-border">
+        {/* User block + logout */}
+        <div className="p-4 border-t border-border space-y-2">
+          {(userName || userEmail) && (
+            <div
+              className={cn(
+                "flex items-center gap-3 rounded-lg px-3 py-2 bg-accent/30",
+                !isOpen && "justify-center px-0"
+              )}
+              title={userEmail || userName}
+            >
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                <UserIcon size={16} />
+              </div>
+              {isOpen && (
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium" data-testid="sidebar-user-name">
+                    {userName}
+                  </p>
+                  {userEmail && userEmail !== userName && (
+                    <p className="truncate text-xs text-muted-foreground" data-testid="sidebar-user-email">
+                      {userEmail}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <button
+            onClick={handleLogout}
+            disabled={isSigningOut}
             className={cn(
-              "flex w-full items-center rounded-lg px-3 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors",
+              "flex w-full items-center rounded-lg px-3 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50",
               !isOpen && "justify-center px-0"
             )}
+            data-testid="sidebar-logout"
           >
             <LogOut className={cn("h-5 w-5", isOpen && "mr-3")} />
-            {isOpen && <span>Sair</span>}
+            {isOpen && <span>{isSigningOut ? "Saindo…" : "Sair"}</span>}
           </button>
         </div>
       </div>
