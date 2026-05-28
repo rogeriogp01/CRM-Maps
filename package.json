@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --import ./src/lib/server/leads/__tests__/setup.ts --test src/lib/server/leads/__tests__/cost-guard.test.ts src/lib/server/leads/__tests__/mapper.test.ts src/lib/server/leads/__tests__/outscraper-source.test.ts src/lib/server/leads/__tests__/webhook-auth.test.ts",
     "backfill:inbox": "tsx scripts/backfill_inbox_lead_link.ts"
   },
   "dependencies": {

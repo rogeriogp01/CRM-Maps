@@ -1,0 +1,48 @@
+{
+  "id": "req-test-abc123",
+  "user_id": "user-1",
+  "status": "Success",
+  "api_task": true,
+  "results_location": "https://api.app.outscraper.com/requests/req-test-abc123",
+  "data": [
+    [
+      {
+        "name": "Padaria Central",
+        "phone": "+55 11 3456-7890",
+        "full_address": "Av. Paulista, 1000 - Bela Vista, São Paulo - SP, 01310-100",
+        "city": "São Paulo",
+        "state": "SP",
+        "country": "BR",
+        "category": "Bakery",
+        "type": "Bakery",
+        "rating": 4.6,
+        "reviews": 312,
+        "place_id": "ChIJaaaa1111",
+        "google_id": "ChIJaaaa1111",
+        "query": "padaria São Paulo"
+      },
+      {
+        "name": "Café da Esquina",
+        "phone": "(11) 91234-5678",
+        "address": "Rua Augusta, 500",
+        "city": "São Paulo",
+        "state": "SP",
+        "country": "BR",
+        "category": "Coffee shop",
+        "rating": 4.2,
+        "place_id": "ChIJbbbb2222"
+      },
+      {
+        "name": "Sem Telefone Ltda",
+        "phone": null,
+        "full_address": "Endereço sem telefone",
+        "category": "Other"
+      },
+      {
+        "name": "",
+        "phone": "",
+        "category": "Garbage"
+      }
+    ]
+  ]
+}
