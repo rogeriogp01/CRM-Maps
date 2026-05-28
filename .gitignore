@@ -1,0 +1,10 @@
+node_modules/
+.next/
+dist/
+build/
+.env
+.env.local
+.turbo/
+.vercel/
+coverage/
+*.log
