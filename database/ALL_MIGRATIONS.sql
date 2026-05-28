@@ -351,7 +351,7 @@ begin
     new.account_id,
     coalesce(new.contact_name, v_phone_norm)
   )
-  on conflict (phone_normalized) do nothing
+  on conflict (phone_normalized) where phone_normalized is not null do nothing
   returning id into v_lead_id;
 
   if v_lead_id is null then
