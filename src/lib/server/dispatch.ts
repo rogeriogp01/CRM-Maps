@@ -161,6 +161,51 @@ async function emitDispatchOutboundHistory(params: {
   }
 }
 
+/**
+ * ROGA-42 — quando um envio é bloqueado pela blacklist, sincroniza no CRM:
+ *   - marca o lead correspondente como "Perdido" (se ainda não fechado)
+ *   - grava histórico de tentativa bloqueada (rastro LGPD)
+ *
+ * Tolera ausência de lead no CRM: blacklist pode existir só em
+ * phone_blacklist (alguém digitou direto sem ter virado lead).
+ */
+async function syncCrmOptOutBlock(params: {
+  phoneNormalized: string;
+}): Promise<void> {
+  try {
+    const { data: leadRow } = await supabaseAdmin
+      .from("crm_leads")
+      .select("id, status")
+      .or(
+        `phone_normalized.eq.${params.phoneNormalized},phone.eq.${params.phoneNormalized}`
+      )
+      .maybeSingle();
+
+    if (!leadRow?.id) return;
+
+    if (leadRow.status !== "Fechado" && leadRow.status !== "Perdido") {
+      await supabaseAdmin
+        .from("crm_leads")
+        .update({
+          status: "Perdido",
+          last_interaction_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", leadRow.id);
+    }
+
+    await appendCrmHistory({
+      lead_id: leadRow.id,
+      type: "dispatch_blocked_opt_out",
+      message:
+        "Disparo bloqueado: telefone está em phone_blacklist (opt-out). Nenhuma mensagem enviada.",
+      whatsapp_account_id: null,
+    });
+  } catch (err) {
+    console.error("[dispatch] syncCrmOptOutBlock failed:", err);
+  }
+}
+
 async function syncCrm(params: {
   phoneNormalized: string;
   renderedMessage: string;
