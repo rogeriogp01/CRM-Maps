@@ -6,7 +6,9 @@
     "dev": "next dev --webpack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --import ./src/lib/server/leads/__tests__/setup.ts --test src/lib/server/leads/__tests__/cost-guard.test.ts src/lib/server/leads/__tests__/mapper.test.ts src/lib/server/leads/__tests__/outscraper-source.test.ts src/lib/server/leads/__tests__/webhook-auth.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.1",
@@ -36,6 +38,7 @@
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.11",
+    "tsx": "^4.22.3",
     "typescript": "latest"
   }
 }
