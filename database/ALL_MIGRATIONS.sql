@@ -1,5 +1,7 @@
 -- ============================================================
--- ALL MIGRATIONS COMBINED (001 → 008)
+-- ALL MIGRATIONS COMBINED (001 → 008 + 010)
+-- Note: 009 (metric_snapshots) is owned by a parallel ROGA-92.x
+-- effort and is intentionally not bundled here yet.
 -- Idempotente: seguro para rodar múltiplas vezes.
 -- ============================================================
 
@@ -271,6 +273,42 @@ begin
   end if;
   create policy "chat-media public read" on storage.objects
     for select using (bucket_id = 'chat-media');
+end $$;
+
+-- ============================================================
+-- 010: RLS policies MVP (ROGA-108 / ROGA-92.1)
+-- Single-tenant: authenticated role can do everything on every
+-- /api/* table. Multi-tenant by workspace_id is ROGA-74.
+-- ============================================================
+do $$
+declare
+  t text;
+  tables text[] := array[
+    'crm_columns',
+    'crm_leads',
+    'crm_history',
+    'chat_conversations',
+    'chat_messages',
+    'whatsapp_accounts',
+    'message_dispatch_history',
+    'campaign_leads',
+    'system_settings'
+  ];
+begin
+  foreach t in array tables loop
+    if exists (
+      select 1 from pg_tables
+       where schemaname = 'public'
+         and tablename  = t
+    ) then
+      execute format('alter table public.%I enable row level security', t);
+      execute format('drop policy if exists auth_can_all on public.%I', t);
+      execute format(
+        'create policy auth_can_all on public.%I for all to authenticated using (true) with check (true)',
+        t
+      );
+    end if;
+  end loop;
 end $$;
 
 -- ============================================================
