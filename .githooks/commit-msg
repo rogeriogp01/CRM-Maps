@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# commit-msg hook — ROGA-119 (delegated from ROGA-115)
+#
+# Enforces tracker↔repo bidirectional linkage: every non-mainline commit
+# must reference its Paperclip issue identifier (ROGA-XX) so the weekly
+# audit `weekly-tracker-repo-audit` can match `git log --grep` against
+# the tracker.
+#
+# Exempt branches: master, main, hotfix/*
+#
+# To enable locally:
+#   git config core.hooksPath .githooks
+#
+# See: docs/issue-closure-dod.md
+#
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG="$(cat "$COMMIT_MSG_FILE")"
+
+# Skip merge / fixup / squash commits — they inherit their parent's message.
+if [[ "$COMMIT_MSG" =~ ^Merge\  ]] || [[ "$COMMIT_MSG" =~ ^fixup! ]] || [[ "$COMMIT_MSG" =~ ^squash! ]]; then
+  exit 0
+fi
+
+# Determine current branch. During detached-HEAD (rebase, bisect) we cannot
+# reliably classify the branch, so we skip the check to avoid breaking
+# automated workflows.
+BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
+if [[ -z "$BRANCH" ]]; then
+  exit 0
+fi
+
+# Exempt mainline / hotfix branches.
+case "$BRANCH" in
+  master|main)            exit 0 ;;
+  hotfix/*)               exit 0 ;;
+esac
+
+# Require ROGA-XX (case-insensitive, hyphen + digits) somewhere in the
+# commit message.
+if [[ ! "$COMMIT_MSG" =~ [Rr][Oo][Gg][Aa]-[0-9]+ ]]; then
+  cat >&2 <<EOF
+✗ commit-msg rejected — missing tracker reference.
+
+Branch:  $BRANCH
+Reason:  commit message does not contain a Paperclip issue identifier
+         (expected pattern: ROGA-<number>, e.g. ROGA-119).
+
+Why this matters:
+  The weekly tracker↔repo audit relies on \`git log --grep\` to match
+  commits back to Paperclip issues. Commits without ROGA-XX become
+  invisible to that audit, so done-issues can drift from the repo.
+
+Fix:
+  - Amend your commit message to include the issue identifier:
+      git commit --amend
+  - Or, if this commit is exempt (release/hotfix), commit from
+    master / main / hotfix/* instead.
+
+See: docs/issue-closure-dod.md
+EOF
+  exit 1
+fi
+
+exit 0

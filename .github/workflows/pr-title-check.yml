@@ -1,0 +1,68 @@
+name: PR Title Check
+
+# ROGA-119 (delegated from ROGA-115)
+#
+# Enforces that every PR title contains a Paperclip issue identifier
+# (ROGA-XX). This keeps the tracker↔repo linkage bidirectional and
+# allows the weekly `weekly-tracker-repo-audit` to match merged PRs
+# back to Paperclip issues.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-title:
+    name: Require ROGA-XX in PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title contains ROGA-XX
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          echo "PR title : ${PR_TITLE}"
+          echo "PR base  : ${PR_BASE}"
+
+          # Hotfix PRs are exempt (mirrors the local commit-msg hook).
+          if [[ "${PR_BASE}" == hotfix/* ]]; then
+            echo "Base branch ${PR_BASE} is hotfix/* — skipping check."
+            exit 0
+          fi
+
+          if echo "${PR_TITLE}" | grep -Eqi '\bROGA-[0-9]+\b'; then
+            echo "✓ PR title contains a ROGA-XX identifier."
+            exit 0
+          fi
+
+          cat >&2 <<EOF
+          ✗ PR title check failed — missing tracker reference.
+
+          Title:  ${PR_TITLE}
+          Reason: PR title does not contain a Paperclip issue identifier
+                  (expected pattern: ROGA-<number>, e.g. ROGA-119).
+
+          Why this matters:
+            The weekly tracker↔repo audit relies on PR titles and commit
+            messages to match merged work back to Paperclip issues. PRs
+            without ROGA-XX become invisible to that audit, so done-issues
+            can drift from the repo.
+
+          Fix:
+            - Edit the PR title and prepend the issue identifier, e.g.:
+                ROGA-119: PR-title check exigir ROGA-XX
+            - Or, if this PR is a true hotfix, target a hotfix/* base
+              branch.
+
+          See: docs/issue-closure-dod.md
+          EOF
+          exit 1
