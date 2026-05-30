@@ -1,8 +1,20 @@
-﻿import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/server/supabase-admin";
+import { NextResponse } from "next/server";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
+/**
+ * ROGA-92 / ROGA-59 — handler-piloto migrado de `supabaseAdmin` (service-role)
+ * para `createSupabaseServerClient` (cookie-bound, expõe `auth.uid()`).
+ *
+ * Pré-requisito: policy RLS em `crm_columns` permitindo SELECT/INSERT para
+ * role `authenticated`. Veja `database/009_rls_policies_mvp.sql` (ROGA-92.1).
+ * Sem a policy, este handler retorna `{ columns: [] }` em GET e 500 em POST.
+ *
+ * O middleware (src/middleware.ts) já garante 401 antes de chegar aqui — não
+ * é preciso revalidar a sessão neste handler.
+ */
 export async function GET() {
-  const { data, error } = await supabaseAdmin
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
     .from("crm_columns")
     .select("id,name,order,color,created_at")
     .order("order", { ascending: true });
@@ -24,7 +36,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Nome e ordem são obrigatórios" }, { status: 400 });
   }
 
-  const { data, error } = await supabaseAdmin
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
     .from("crm_columns")
     .insert({ name, order, color })
     .select("id,name,order,color,created_at")
